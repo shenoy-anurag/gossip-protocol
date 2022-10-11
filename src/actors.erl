@@ -4,7 +4,7 @@
 -import(rng, [rnd_number/1]).
 -import(utils, [writeKV/2, mod/2]).
 
--export([init/3, gossipWorker/3]).
+-export([init/3, gossipWorker/3, pushSumWorker/6]).
 
 rumorLimit() ->
     10.
@@ -13,6 +13,9 @@ gossipWorker(SupervisorPid, Neighbors, RumorsHeard) ->
     receive
         {health_check} ->
             io:format("Worker is up! ~p~n", [self()]),
+            gossipWorker(SupervisorPid, Neighbors, RumorsHeard);
+        {inform_server} ->
+            SupervisorPid ! {add_worker, self()},
             gossipWorker(SupervisorPid, Neighbors, RumorsHeard);
         {setup, SetupNeighbors} ->
             io:format("Setting up the neighbours of worker ~p~n", [self()]),
@@ -33,6 +36,71 @@ gossipWorker(SupervisorPid, Neighbors, RumorsHeard) ->
             end
     end.
 
+roundLimit() ->
+    3.
+
+pushSumWorker(SupervisorPid, Neighbors, Sum, Weight, Round, IsConverged) ->
+    receive
+        {health_check} ->
+            io:format("Worker is up! ~p~n", [self()]),
+            pushSumWorker(SupervisorPid, Neighbors, Sum, Weight, Round, IsConverged);
+        {inform_server} ->
+            SupervisorPid ! {add_worker, self()},
+            pushSumWorker(SupervisorPid, Neighbors, Sum, Weight, Round, IsConverged);
+        {setup, SetupNeighbors} ->
+            io:format("Setting up the neighbours of worker ~p~n", [self()]),
+            pushSumWorker(SupervisorPid, SetupNeighbors, Sum, Weight, Round, IsConverged);
+        {start_push_sum, Delta} ->
+            NeighborPicked = lists:nth(rand:uniform(length(Neighbors)), Neighbors),
+            UpdatedSum = Sum / 2.0,
+            UpdatedWeight = Weight / 2.0,
+            NeighborPicked ! {calc_push_sum, UpdatedSum, UpdatedWeight, Delta},
+            pushSumWorker(SupervisorPid, Neighbors, UpdatedSum, UpdatedWeight, Round, IsConverged);
+        {calc_push_sum, S, W, Delta} ->
+            LenNeighbors = length(Neighbors),
+            NeighborPicked = lists:nth(rand:uniform(LenNeighbors), Neighbors),
+            if
+                IsConverged == false ->
+                    NewSum = Sum + S,
+                    NewWeight = Weight + W,
+                    Diff = abs((Sum / Weight) - (NewSum / NewWeight)),
+                    if
+                        Diff < Delta ->
+                            NewRound = Round + 1;
+                        true ->
+                            NewRound = Round
+                    end,
+                    RoundLimit = roundLimit(),
+                    if
+                        NewRound >= RoundLimit ->
+                            NewIsConverged = true,
+                            SupervisorPid ! {converged, self(), Sum, Weight};
+                        true ->
+                            NewIsConverged = IsConverged
+                    end,
+                    UpdatedSum = NewSum / 2.0,
+                    UpdatedWeight = NewWeight / 2.0,
+                    io:format("~p sharing new push sum with neighbor: ~p~n", [
+                        self(), NeighborPicked
+                    ]),
+                    NeighborPicked ! {calc_push_sum, UpdatedSum, UpdatedWeight, Delta},
+                    pushSumWorker(
+                        SupervisorPid,
+                        Neighbors,
+                        UpdatedSum,
+                        UpdatedWeight,
+                        NewRound,
+                        NewIsConverged
+                    );
+                IsConverged == true ->
+                    % io:format("~p passing on push sum to neighbor: ~p~n", [self(), NeighborPicked]),
+                    NeighborPicked ! {calc_push_sum, S, W, Delta},
+                    pushSumWorker(SupervisorPid, Neighbors, Sum, Weight, Round, IsConverged);
+                true ->
+                    pushSumWorker(SupervisorPid, Neighbors, Sum, Weight, Round, IsConverged)
+            end
+    end.
+
 findSupervisorPid(SupervisorName) ->
     global:send(SupervisorName, {health_check, self()}),
     R =
@@ -49,9 +117,21 @@ spawnMultipleWorkers(SupervisorPid, NumberOfActorsToSpawn, Algorithm) ->
 spawnMultipleWorkers(_, 0, _, ListOfPid) ->
     ListOfPid;
 spawnMultipleWorkers(SupervisorPid, NumberOfActorsToSpawn, Algorithm, ListOfPid) ->
-    spawnMultipleWorkers(SupervisorPid, NumberOfActorsToSpawn - 1, Algorithm, [
-        spawn(actors, gossipWorker, [SupervisorPid, [], 0]) | ListOfPid
-    ]).
+    if
+        Algorithm == "Gossip" ->
+            spawnMultipleWorkers(SupervisorPid, NumberOfActorsToSpawn - 1, Algorithm, [
+                spawn(actors, gossipWorker, [SupervisorPid, [], 0]) | ListOfPid
+            ]);
+        Algorithm == "PushSum" ->
+            spawnMultipleWorkers(SupervisorPid, NumberOfActorsToSpawn - 1, Algorithm, [
+                spawn(actors, pushSumWorker, [SupervisorPid, [], NumberOfActorsToSpawn, 1, 0, false])
+                | ListOfPid
+            ]);
+        true ->
+            spawnMultipleWorkers(SupervisorPid, NumberOfActorsToSpawn - 1, Algorithm, [
+                spawn(actors, gossipWorker, [SupervisorPid, [], 0]) | ListOfPid
+            ])
+    end.
 
 findNeighboursLine(Map, N, I, _) when I > N ->
     Map;
@@ -71,7 +151,10 @@ findNeighboursLine(Map, N, I, Pids) ->
             findNeighboursLine(NewMap, N, I + 1, Pids)
     end.
 
-findNeighboursGrid(Map, _, N, I, Pids) when I > N ->
+% TODO: Consider an alternative approach. Loop over the four neighbors of every cell,
+% and only append those which are valid. Combine the map created using this function
+% with all others to build the overall neighbor map.
+findNeighboursGrid(Map, _, N, I, _) when I > N ->
     Map;
 findNeighboursGrid(Map, Side, N, I, Pids) ->
     RowNum = ceil(I / Side),
@@ -135,9 +218,7 @@ findNeighboursGrid(Map, Side, N, I, Pids) ->
             NewMap = maps:put(I, Neighbors, Map),
             findNeighboursGrid(NewMap, Side, N, I + 1, Pids)
     end.
-% TODO: Consider an alternative approach. Loop over the four neighbors of every cell,
-% and only append those which are valid. Combine the map created using this function
-% with all others to build the overall neighbor map.
+
 basicCheck(N, NeighborI) ->
     if
         (NeighborI > 0) and (NeighborI < N) ->
@@ -199,72 +280,6 @@ findNeighborsOf3DCell(ListOfNeighbors, Side, N, I, NumNeighborsToCheck, Pids) ->
     end,
     findNeighborsOf3DCell(NewListOfNeighbors, Side, N, I, NumNeighborsToCheck - 1, Pids).
 
-% findNeighborsOf3DCell(ListOfNeighbors, Side, N, I, NumNeighborsToCheck, Pids) ->
-%     if
-%         NumNeighborsToCheck == 1 ->
-%             Neighbor = I - 1,
-%             IsValidNeigh = checkIfValidNeighbor(Side, N, I, Neighbor),
-%             if
-%                 IsValidNeigh == true ->
-%                     NewListOfNeighbors = [lists:nth(Neighbor, Pids) | ListOfNeighbors];
-%                 true ->
-%                     NewListOfNeighbors = ListOfNeighbors
-%             end,
-%             findNeighborsOf3DCell(NewListOfNeighbors, Side, N, I, NumNeighborsToCheck - 1, Pids);
-%         NumNeighborsToCheck == 2 ->
-%             Neighbor = I + 1,
-%             IsValidNeigh = checkIfValidNeighbor(Side, N, I, Neighbor),
-%             if
-%                 IsValidNeigh == true ->
-%                     NewListOfNeighbors = [lists:nth(Neighbor, Pids) | ListOfNeighbors];
-%                 true ->
-%                     NewListOfNeighbors = ListOfNeighbors
-%             end,
-%             findNeighborsOf3DCell(NewListOfNeighbors, Side, N, I, NumNeighborsToCheck - 1, Pids);
-%         NumNeighborsToCheck == 3 ->
-%             Neighbor = I - Side,
-%             IsValidNeigh = checkIfValidNeighbor(Side, N, I, Neighbor),
-%             if
-%                 IsValidNeigh == true ->
-%                     NewListOfNeighbors = [lists:nth(Neighbor, Pids) | ListOfNeighbors];
-%                 true ->
-%                     NewListOfNeighbors = ListOfNeighbors
-%             end,
-%             findNeighborsOf3DCell(NewListOfNeighbors, Side, N, I, NumNeighborsToCheck - 1, Pids);
-%         NumNeighborsToCheck == 4 ->
-%             Neighbor = I + Side,
-%             IsValidNeigh = checkIfValidNeighbor(Side, N, I, Neighbor),
-%             if
-%                 IsValidNeigh == true ->
-%                     NewListOfNeighbors = [lists:nth(Neighbor, Pids) | ListOfNeighbors];
-%                 true ->
-%                     NewListOfNeighbors = ListOfNeighbors
-%             end,
-%             findNeighborsOf3DCell(NewListOfNeighbors, Side, N, I, NumNeighborsToCheck - 1, Pids);
-%         NumNeighborsToCheck == 5 ->
-%             Neighbor = I - (Side * Side),
-%             IsValidNeigh = checkIfValidNeighbor(Side, N, I, Neighbor),
-%             if
-%                 IsValidNeigh == true ->
-%                     NewListOfNeighbors = [lists:nth(Neighbor, Pids) | ListOfNeighbors];
-%                 true ->
-%                     NewListOfNeighbors = ListOfNeighbors
-%             end,
-%             findNeighborsOf3DCell(NewListOfNeighbors, Side, N, I, NumNeighborsToCheck - 1, Pids);
-%         NumNeighborsToCheck == 6 ->
-%             Neighbor = I + (Side * Side),
-%             IsValidNeigh = checkIfValidNeighbor(Side, N, I, Neighbor),
-%             if
-%                 IsValidNeigh == true ->
-%                     NewListOfNeighbors = [lists:nth(Neighbor, Pids) | ListOfNeighbors];
-%                 true ->
-%                     NewListOfNeighbors = ListOfNeighbors
-%             end,
-%             findNeighborsOf3DCell(NewListOfNeighbors, Side, N, I, NumNeighborsToCheck - 1, Pids);
-%         true ->  % middle elements - previous, upper, next, and lower are neighbors.
-%             findNeighborsOf3DCell(ListOfNeighbors, Side, N, I, NumNeighborsToCheck - 1, Pids)
-%     end.
-
 findNeighbours3D(Map, _, N, I, _) when I > N ->
     Map;
 findNeighbours3D(Map, Side, N, I, Pids) ->
@@ -281,27 +296,38 @@ setupWorkers(WorkerPids, NeighboursMap, N, I) ->
     Pid ! {setup, Neighbors},
     setupWorkers(WorkerPids, NeighboursMap, N, I + 1).
 
+informSupervisor(_, N, I) when I > N ->
+    ok;
+informSupervisor(WorkerPids, N, I) ->
+    Pid = lists:nth(I, WorkerPids),
+    Pid ! {inform_server},
+    informSupervisor(WorkerPids, N, I + 1).
+
 setupTopology(Topology, Dims, NumNodes, WorkerPids) ->
     if
         Topology == "Line" ->
             io:format("Setting up workers for Line topology~n"),
             NeighboursMap = findNeighboursLine(maps:new(), NumNodes, 1, WorkerPids),
             io:format("Topology neighbors: ~p~n", [NeighboursMap]),
-            setupWorkers(WorkerPids, NeighboursMap, NumNodes, 1);
-        Topology == "2D" -> % not working atm
+            setupWorkers(WorkerPids, NeighboursMap, NumNodes, 1),
+            informSupervisor(WorkerPids, NumNodes, 1);
+        % not working atm
+        Topology == "2D" ->
             io:format("Setting up workers for 2D topology~n"),
             NeighboursMap = findNeighboursGrid(
                 maps:new(), lists:nth(2, Dims), NumNodes, 1, WorkerPids
             ),
             io:format("Topology neighbors: ~p~n", [NeighboursMap]),
-            setupWorkers(WorkerPids, NeighboursMap, NumNodes, 1);
+            setupWorkers(WorkerPids, NeighboursMap, NumNodes, 1),
+            informSupervisor(WorkerPids, NumNodes, 1);
         (Topology == "3D") or (Topology == "Imp3D") ->
             io:format("Setting up workers for 3D topology~n"),
             NeighboursMap = findNeighbours3D(
                 maps:new(), lists:nth(2, Dims), NumNodes, 1, WorkerPids
             ),
             io:format("Topology neighbors: ~p~n", [NeighboursMap]),
-            setupWorkers(WorkerPids, NeighboursMap, NumNodes, 1);
+            setupWorkers(WorkerPids, NeighboursMap, NumNodes, 1),
+            informSupervisor(WorkerPids, NumNodes, 1);
         true ->
             false
     end.
