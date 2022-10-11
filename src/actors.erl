@@ -10,6 +10,7 @@ rumorLimit() ->
     10.
 
 gossipWorker(SupervisorPid, Neighbors, RumorsHeard) ->
+    % StartTime = erlang:monotonic_time(),
     receive
         {health_check} ->
             io:format("Worker is up! ~p~n", [self()]),
@@ -20,6 +21,9 @@ gossipWorker(SupervisorPid, Neighbors, RumorsHeard) ->
         {setup, SetupNeighbors} ->
             io:format("Setting up the neighbours of worker ~p~n", [self()]),
             gossipWorker(SupervisorPid, SetupNeighbors, RumorsHeard);
+        {terminate} ->
+            SupervisorPid ! {terminated, self()},
+            false;
         {share_gossip, Rumor} ->
             RumorLimit = rumorLimit() + 1,
             if
@@ -40,6 +44,7 @@ roundLimit() ->
     3.
 
 pushSumWorker(SupervisorPid, Neighbors, Sum, Weight, Round, IsConverged) ->
+    % StartTime = erlang:monotonic_time(),
     receive
         {health_check} ->
             io:format("Worker is up! ~p~n", [self()]),
@@ -50,6 +55,11 @@ pushSumWorker(SupervisorPid, Neighbors, Sum, Weight, Round, IsConverged) ->
         {setup, SetupNeighbors} ->
             io:format("Setting up the neighbours of worker ~p~n", [self()]),
             pushSumWorker(SupervisorPid, SetupNeighbors, Sum, Weight, Round, IsConverged);
+        {terminate} ->
+            NewIsConverged = true,
+            % EndTime = erlang:monotonic_time(),
+            SupervisorPid ! {converged, self(), Sum, Weight},
+            pushSumWorker(SupervisorPid, Neighbors, Sum, Weight, Round, NewIsConverged);
         {start_push_sum, Delta} ->
             NeighborPicked = lists:nth(rand:uniform(length(Neighbors)), Neighbors),
             UpdatedSum = Sum / 2.0,
@@ -74,6 +84,7 @@ pushSumWorker(SupervisorPid, Neighbors, Sum, Weight, Round, IsConverged) ->
                     if
                         NewRound >= RoundLimit ->
                             NewIsConverged = true,
+                            % EndTime = erlang:monotonic_time(),
                             SupervisorPid ! {converged, self(), Sum, Weight};
                         true ->
                             NewIsConverged = IsConverged
@@ -150,6 +161,12 @@ findNeighboursLine(Map, N, I, Pids) ->
             NewMap = maps:put(I, Neighbors, Map),
             findNeighboursLine(NewMap, N, I + 1, Pids)
     end.
+
+getNeighboursFull(Map, N, I, _) when I > N ->
+    Map;
+getNeighboursFull(Map, N, I, Pids) ->
+    NewMap = maps:put(I, Pids, Map),
+    getNeighboursFull(NewMap, N, I + 1, Pids).
 
 % TODO: Consider an alternative approach. Loop over the four neighbors of every cell,
 % and only append those which are valid. Combine the map created using this function
@@ -303,6 +320,14 @@ informSupervisor(WorkerPids, N, I) ->
     Pid ! {inform_server},
     informSupervisor(WorkerPids, N, I + 1).
 
+randomlyTerminateActors(_, 0) ->
+    ok;
+randomlyTerminateActors(WorkerPids, N) ->
+    Pid = lists:nth(rand:uniform(length(WorkerPids)), WorkerPids),
+    Pid ! {terminate},
+    randomlyTerminateActors(WorkerPids, N - 1).
+
+
 setupTopology(Topology, Dims, NumNodes, WorkerPids) ->
     if
         Topology == "Line" ->
@@ -311,7 +336,6 @@ setupTopology(Topology, Dims, NumNodes, WorkerPids) ->
             io:format("Topology neighbors: ~p~n", [NeighboursMap]),
             setupWorkers(WorkerPids, NeighboursMap, NumNodes, 1),
             informSupervisor(WorkerPids, NumNodes, 1);
-        % not working atm
         Topology == "2D" ->
             io:format("Setting up workers for 2D topology~n"),
             NeighboursMap = findNeighboursGrid(
@@ -320,11 +344,26 @@ setupTopology(Topology, Dims, NumNodes, WorkerPids) ->
             io:format("Topology neighbors: ~p~n", [NeighboursMap]),
             setupWorkers(WorkerPids, NeighboursMap, NumNodes, 1),
             informSupervisor(WorkerPids, NumNodes, 1);
-        (Topology == "3D") or (Topology == "Imp3D") ->
+        (Topology == "3D") ->
             io:format("Setting up workers for 3D topology~n"),
             NeighboursMap = findNeighbours3D(
                 maps:new(), lists:nth(2, Dims), NumNodes, 1, WorkerPids
             ),
+            io:format("Topology neighbors: ~p~n", [NeighboursMap]),
+            setupWorkers(WorkerPids, NeighboursMap, NumNodes, 1),
+            informSupervisor(WorkerPids, NumNodes, 1);
+        (Topology == "Imp3D") ->
+            io:format("Setting up workers for Imperfect 3D topology~n"),
+            NeighboursMap = findNeighbours3D(
+                maps:new(), lists:nth(2, Dims), NumNodes, 1, WorkerPids
+            ),
+            io:format("Topology neighbors: ~p~n", [NeighboursMap]),
+            setupWorkers(WorkerPids, NeighboursMap, NumNodes, 1),
+            informSupervisor(WorkerPids, NumNodes, 1),
+            randomlyTerminateActors(WorkerPids, NumNodes / 10);
+        Topology == "Full" ->
+            io:format("Setting up workers for Full topology~n"),
+            NeighboursMap = getNeighboursFull(maps:new(), NumNodes, 1, WorkerPids),
             io:format("Topology neighbors: ~p~n", [NeighboursMap]),
             setupWorkers(WorkerPids, NeighboursMap, NumNodes, 1),
             informSupervisor(WorkerPids, NumNodes, 1);
